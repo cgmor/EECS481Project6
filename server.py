@@ -2,6 +2,8 @@ import os
 import json
 import importlib
 import logging
+import re
+
 
 from functools import partial
 
@@ -9,6 +11,9 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.routing import Route
+from core.utils import find_figure_region
+from core.api import AbstractDrawingRequest
+
 
 from config import config
 from routes import routes_config
@@ -26,6 +31,8 @@ handler.setFormatter(logging.Formatter("%(message)s"))
 logger.addHandler(handler)
 
 app = FastAPI(openapi_url=None, docs_url=None)
+
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,6 +77,21 @@ def add_routes(app, routes):
             methods=[route["method"]]
         )
 
+@app.get("/patents/{pn}/drawings/find", response_class=FileResponse)
+async def find_drawing(pn: str, q: str):
+    # extract figure number
+    m = re.search(r"\d+", q or "")
+    if not m:
+        raise HTTPException(400, detail="Query must contain a figure number")
+    fig_num = int(m.group())
+
+    # get S3 prefix
+    req = AbstractDrawingRequest({"pn": pn})
+    jpg = find_figure_region(req.S3_BUCKET, req._get_prefix(), fig_num)
+    if not jpg:
+        raise HTTPException(404, detail=f"Figure {fig_num} not found")
+    return FileResponse(jpg, filename=os.path.basename(jpg))
+
 add_routes(app, routes_config)
 
 async def serve_favicon(request):
@@ -84,6 +106,9 @@ async def save_user_feedback(request: Request):
         f.write(json.dumps(data))
         f.write("\n")
     return JSONResponse(content={"success": True}, status_code=200)
+
+
+
 
 def handle_error(e):
     if isinstance(e, API.ResourceNotFoundError):

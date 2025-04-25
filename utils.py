@@ -5,8 +5,18 @@ Shared utilities
 import re
 from functools import lru_cache
 import numpy as np
+import os
+from PIL import Image
+import botocore.exceptions
+import pytesseract
+import sys
+import easyocr
+import time
+
 
 from config.config import models_dir
+_reader = easyocr.Reader(["en"], gpu=False)
+
 
 # Load stopwords
 stopword_file = models_dir + 'stopwords.txt'
@@ -220,3 +230,61 @@ def get_faln(authors): # faln = first author's last name
     if len(authors) > 1:
         faln += ' et al.'
     return faln
+
+def find_figure_region(s3_bucket, prefix, figure_num):
+    print("[DEBUG] → ENTERED find_figure_region", file=sys.stderr)
+    print(f"[DEBUG] prefix={prefix}", file=sys.stderr)
+
+    num = int(figure_num)
+    pat = re.compile(rf"(?:fig(?:ure)?\.?\s*{num})", re.IGNORECASE)
+
+    indexes = [
+        o.key.rsplit("-", 1)[-1].split(".")[0]
+        for o in s3_bucket.objects.filter(Prefix=prefix)
+    ]
+    print(f"[DEBUG] pages={indexes}", file=sys.stderr)
+
+    for idx in indexes:
+        tif_key = f"{prefix}{idx}.tif"
+        tmp_tif = f"/tmp/{idx}.tif"
+        out_jpg = f"/tmp/{idx}-fig{num}.jpg"
+
+        try:
+            s3_bucket.download_file(tif_key, tmp_tif)
+        except botocore.exceptions.ClientError:
+            print(f"[DEBUG] missing {tif_key}", file=sys.stderr)
+            continue
+
+        img = Image.open(tmp_tif).convert("RGB")
+        img.thumbnail((1024, 1024), Image.LANCZOS)
+        os.remove(tmp_tif)
+        print(f"[DEBUG] loaded page {idx}", file=sys.stderr)
+
+        # DO TESSERACT
+        t0 = time.time()
+        full_text = pytesseract.image_to_string(img)
+        t1 = time.time()
+        print(f"[TIMING][Page {idx}] Tesseract took {t1-t0:.2f}s", file=sys.stderr)
+
+        if pat.search(full_text):
+            print(f"[DEBUG] Tesseract matched on page {idx}", file=sys.stderr)
+            img.save(out_jpg, "JPEG", quality=80)
+            return out_jpg
+
+        # EASYOCR just in case
+        arr = np.array(img)
+        t2 = time.time()
+        results = _reader.readtext(arr, detail=1)
+        t3 = time.time()
+        print(f"[TIMING][Page {idx}] EasyOCR took {t3-t2:.2f}s", file=sys.stderr)
+
+        page_text = " ".join(txt for _, txt, _ in results)
+        if pat.search(page_text):
+            print(f"[DEBUG] EasyOCR matched on page {idx}", file=sys.stderr)
+            img.save(out_jpg, "JPEG", quality=80)
+            return out_jpg
+
+        print(f"[DEBUG] No Fig.{num} on page {idx}", file=sys.stderr)
+
+    print(f"[DEBUG] Figure {num} not found in pages {indexes}", file=sys.stderr)
+    return None
